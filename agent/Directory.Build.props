@@ -1,0 +1,18 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+
+    <!--
+      Same repository/volume as backend/ (see backend/Directory.Build.props): this
+      lives on an exFAT volume, so macOS writes an AppleDouble sidecar (._Foo.cs)
+      beside every file. DefaultItemExcludes runs before the SDK's default source
+      glob expands, which is why the exclusion has to live here rather than as a
+      <Compile Remove> in each project.
+    -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);**/._*</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>

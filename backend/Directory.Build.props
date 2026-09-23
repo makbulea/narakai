@@ -1,0 +1,21 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+
+    <!--
+      This repository lives on an exFAT volume. exFAT has no native extended
+      attributes, so macOS stores them in an AppleDouble sidecar (._Foo.cs) beside
+      every file. Those sidecars are binary and the SDK's default source glob picks
+      them up as C# files.
+
+      DefaultItemExcludes is the right lever: it feeds the SDK *before* the globs are
+      expanded. A `<Compile Remove>` in this file would run too early to matter,
+      because the default items do not exist yet when Directory.Build.props is imported.
+    -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);**/._*</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>

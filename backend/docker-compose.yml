@@ -1,0 +1,256 @@
+# Full local environment: infrastructure plus all six services.
+#
+#   docker compose up -d --build
+#
+# Every service waits for the infrastructure it needs via healthchecks, so a cold start
+# does not produce a wall of connection errors. Secrets come from .env — nothing
+# sensitive is written into this file.
+
+name: ecommerce
+
+services:
+  # ---------------------------------------------------------------- infrastructure
+  postgres:
+    image: postgres:17-alpine
+    container_name: ecommerce-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Creates the six service databases once Postgres is accepting connections.
+  #
+  # A one-shot container rather than a script mounted into
+  # /docker-entrypoint-initdb.d, because that would bind-mount a host path — and a
+  # host path is not guaranteed to be visible inside the Docker VM. On Colima only
+  # $HOME is shared by default, so a repository anywhere else silently mounts as an
+  # empty directory. This approach carries its own script and works everywhere.
+  postgres-init:
+    image: postgres:17-alpine
+    container_name: ecommerce-postgres-init
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        for db in customer_db product_db inventory_db order_db payment_db notification_db; do
+          echo "Ensuring database $$db"
+          psql -h postgres -U ${POSTGRES_USER:-postgres} -d postgres -tc \
+            "SELECT 1 FROM pg_database WHERE datname = '$$db'" | grep -q 1 \
+            || psql -h postgres -U ${POSTGRES_USER:-postgres} -d postgres -c "CREATE DATABASE $$db"
+        done
+        echo "All databases ready"
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce-redis
+    # Persistence is off on purpose: everything Redis holds here (product cache,
+    # idempotency reservations, locks) is either rebuildable or short-lived.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: ecommerce-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode — no ZooKeeper. One node acting as both broker and controller.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
+      # Two advertised listeners: containers reach the broker as kafka:19092, the host
+      # reaches it as localhost:9092. Getting this wrong is the classic "producer
+      # connects then times out" failure.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Single broker, so nothing can be replicated further than one copy.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # Creates every topic (and its dead-letter companion) before the services start.
+  #
+  # Auto-creation is enabled as a safety net, but a consumer that subscribes before any
+  # producer has written logs "Unknown topic or partition" and retries — noise that looks
+  # like a fault. Creating them up front also lets partition counts be set deliberately
+  # rather than inherited from a default.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: ecommerce-kafka-init
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        for t in customer-events product-events inventory-events order-events payment-events notification-events; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 \
+            --create --if-not-exists --topic "$$t" --partitions 3 --replication-factor 1
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 \
+            --create --if-not-exists --topic "$$t.dlq" --partitions 1 --replication-factor 1
+        done
+        echo "Topics ready"
+    restart: "no"
+
+  # ---------------------------------------------------------------------- services
+  customer-service:
+    build:
+      context: .
+      args:
+        SERVICE: CustomerService
+    container_name: ecommerce-customer
+    ports:
+      - "5001:8080"
+    environment: &common-env
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
+      Kafka__BootstrapServers: kafka:19092
+      Jwt__SigningKey: ${JWT_SIGNING_KEY}
+      Jwt__Issuer: ecommerce-local
+      Jwt__Audience: ecommerce-api
+      ConnectionStrings__Redis: redis:6379
+      ConnectionStrings__CustomerDb: Host=postgres;Port=5432;Database=customer_db;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      postgres-init: { condition: service_completed_successfully }
+      kafka-init: { condition: service_completed_successfully }
+    healthcheck: &health
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  product-service:
+    build:
+      context: .
+      args:
+        SERVICE: ProductService
+    container_name: ecommerce-product
+    ports:
+      - "5002:8080"
+    environment:
+      <<: *common-env
+      ConnectionStrings__ProductDb: Host=postgres;Port=5432;Database=product_db;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      postgres-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    healthcheck: *health
+
+  inventory-service:
+    build:
+      context: .
+      args:
+        SERVICE: InventoryService
+    container_name: ecommerce-inventory
+    ports:
+      - "5003:8080"
+    environment:
+      <<: *common-env
+      ConnectionStrings__InventoryDb: Host=postgres;Port=5432;Database=inventory_db;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      postgres-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    healthcheck: *health
+
+  order-service:
+    build:
+      context: .
+      args:
+        SERVICE: OrderService
+    container_name: ecommerce-order
+    ports:
+      - "5004:8080"
+    environment:
+      <<: *common-env
+      ConnectionStrings__OrderDb: Host=postgres;Port=5432;Database=order_db;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+      Services__Customer: http://customer-service:8080
+      Services__Product: http://product-service:8080
+      Services__Inventory: http://inventory-service:8080
+      Services__Payment: http://payment-service:8080
+    depends_on:
+      postgres-init: { condition: service_completed_successfully }
+      kafka-init: { condition: service_completed_successfully }
+      customer-service: { condition: service_started }
+      product-service: { condition: service_started }
+      inventory-service: { condition: service_started }
+      payment-service: { condition: service_started }
+    healthcheck: *health
+
+  payment-service:
+    build:
+      context: .
+      args:
+        SERVICE: PaymentService
+    container_name: ecommerce-payment
+    ports:
+      - "5005:8080"
+    environment:
+      <<: *common-env
+      ConnectionStrings__PaymentDb: Host=postgres;Port=5432;Database=payment_db;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+      # Non-zero in development so the compensation path is actually exercised.
+      PaymentProvider__FailureRate: ${PAYMENT_FAILURE_RATE:-0.15}
+    depends_on:
+      postgres-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    healthcheck: *health
+
+  notification-service:
+    build:
+      context: .
+      args:
+        SERVICE: NotificationService
+    container_name: ecommerce-notification
+    ports:
+      - "5006:8080"
+    environment:
+      <<: *common-env
+      ConnectionStrings__NotificationDb: Host=postgres;Port=5432;Database=notification_db;Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres}
+      Services__Customer: http://customer-service:8080
+      Services__Order: http://order-service:8080
+    depends_on:
+      postgres-init: { condition: service_completed_successfully }
+      kafka-init: { condition: service_completed_successfully }
+    healthcheck: *health
+
+volumes:
+  postgres-data:
+  kafka-data:

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <!-- Only BuildingBlocks.Core (plain library, no ASP.NET Core framework dependency) —
+         reused here for DomainExceptions.DownstreamServiceException, matching the same
+         shape backend's own inter-service clients use. BuildingBlocks.Web (ServiceDefaults,
+         resilience, auth) is an ASP.NET Core host concern and is referenced by
+         CodeIntelligence.Agent.Api instead, not by this library. -->
+    <ProjectReference Include="..\..\..\backend\src\BuildingBlocks\BuildingBlocks.Core\BuildingBlocks.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Official Anthropic SDK (see agent/docs/AGENT.md — LLM provider). Version pinned
+         provisionally; run `dotnet add package Anthropic` once the .NET 10 SDK is
+         installed to confirm/bump to the actual latest release. -->
+    <PackageReference Include="Anthropic" Version="12.9.0" />
+
+    <!-- Same set rag/src/CodeIntelligence.Rag.csproj references, for the same reason:
+         a plain class library gets none of these for free the way an ASP.NET Core host
+         does — IServiceCollection, IOptions<T>/Configure<T>, and ILogger<T> all need an
+         explicit package here. -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.11" />
+  </ItemGroup>
+
+</Project>

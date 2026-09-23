@@ -1,0 +1,28 @@
+# Documentation under docs/ folders is kept local only
+**/docs/**/*.md
+
+# Claude Code project instructions are kept local only
+CLAUDE.md
+claude.md
+
+# .NET build output
+bin/
+obj/
+TestResults/
+coverage/
+*.user
+*.suo
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# Environment / secrets
+.env
+*.pfx
+*.pem
+*.key
+
+# OS
+.DS_Store
